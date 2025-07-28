@@ -20,7 +20,7 @@ vision_model = (SiglipVisionModel.from_pretrained(embed_model).to(device).eval()
 )
 # vision_model = torch.compile(vision_model, mode="reduce-overhead")#"max-autotune")
 
-idx_dir = Path("./vector_index")
+idx_dir = Path("./demo/vector_index")
 index   = faiss.read_index(str(idx_dir/"derma.index"))
 labels  = [l.strip() for l in (idx_dir/"derma_labels.txt").read_text().splitlines() if l.strip()]
 

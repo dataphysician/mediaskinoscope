@@ -13,9 +13,9 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "pillow>=11.1.0",
     "fastrtc>=0.0.29",
-    "pipecat-ai>=0.0.76",
     "sentencepiece>=0.2.0",
     "torch>=2.7.1",
     "torchvision>=0.22.1",
     "transformers[torch]>=4.53.2",
+    "pipecat-ai>=0.0.76",
 ]
