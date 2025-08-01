@@ -1,156 +1,155 @@
-import re
-import faiss, torch, numpy as np
+import asyncio
+import re, os, faiss, torch, numpy as np
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 import gradio as gr
 from fastrtc import WebRTC, VideoStreamHandler, AdditionalOutputs
 from transformers import AutoProcessor
 from transformers.models.siglip.modeling_siglip import SiglipVisionModel
+from openai import AsyncOpenAI
 
-import os
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-# 1) Load model & FAISS index
+# ———————————————————————————————
+# 1) Model & Index Setup
+# ———————————————————————————————
 device      = "cuda" if torch.cuda.is_available() else "cpu"
-embed_model = "google/medsiglip-448"
+processor   = AutoProcessor.from_pretrained("google/medsiglip-448", use_fast=True)
+vision_model= SiglipVisionModel.from_pretrained("google/medsiglip-448").to(device).eval()
 
-processor = AutoProcessor.from_pretrained(embed_model, use_fast=True)
-vision_model = (SiglipVisionModel.from_pretrained(embed_model).to(device).eval()# .half()
-)
-# vision_model = torch.compile(vision_model, mode="reduce-overhead")#"max-autotune")
+idx = faiss.read_index("demo/vector_index/derma.index")
+labels = [l.strip() for l in open("demo/vector_index/derma_labels.txt") if l.strip()]
 
-idx_dir = Path("./demo/vector_index")
-index   = faiss.read_index(str(idx_dir/"derma.index"))
-labels  = [l.strip() for l in (idx_dir/"derma_labels.txt").read_text().splitlines() if l.strip()]
-
-# 2) Embedding + FAISS lookup
-def query_top_k(image: Image.Image, top_k: int = 3):
-    img = image.convert("RGB")  # client already sends 448×448
+def query_top_k(img: Image.Image, top_k=1):
     inp = processor(images=[img], return_tensors="pt").to(device)
     with torch.no_grad():
         emb = vision_model(**inp).pooler_output.cpu().numpy()
-    norms = np.linalg.norm(emb, axis=1, keepdims=True)
-    emb   = emb / np.where(norms==0, 1, norms)
-    D, I  = index.search(emb.astype("float32"), top_k)
-    return [(labels[i], float(D[0,rank])) for rank,i in enumerate(I[0])]
+    emb /= np.linalg.norm(emb, axis=1, keepdims=True).clip(min=1e-6)
+    D, I = idx.search(emb.astype("float32"), top_k)
+    i0 = I[0][0]
+    return (labels[i0], float(D[0,0])) if i0 >= 0 else ("", 0.0)
 
-_ = query_top_k(Image.new("RGB",(448,448)), top_k=1)  # warm‑up
-
-
-# 3) Frame handler with throttling
-def make_handler(skip_every: int = 3):
-    state = {"count": 0, "last_txt": "Waiting for inference…"}
-    
+# ———————————————————————————————
+# 2) Frame Handler (synchronous)
+# ———————————————————————————————
+def make_handler(skip_every=3):
+    state = {"count": 0, "last_label": "Waiting for inference…"}
     def handler(frame: np.ndarray):
         state["count"] += 1
-
-        # run only every Nth frame
         if state["count"] % skip_every == 0:
+            pil = Image.fromarray(frame).resize((448,448), Image.BILINEAR)
             try:
-                with torch.no_grad():#, torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                    label_score = query_top_k(Image.fromarray(frame), top_k=1)
-                lbl, sc = label_score[0]
+                lbl, _ = query_top_k(pil)
                 if lbl:
-                    state["last_txt"] = lbl
+                    state["last_label"] = lbl
                 torch.cuda.synchronize()
-            except Exception as e:
-                state["last_txt"] = f"Inference error: {e}"
+            except:
                 torch.cuda.empty_cache()
-
-        # return the frame plus a clean string payload
-        return frame, AdditionalOutputs(state["last_txt"])
-
+        return frame, AdditionalOutputs(state["last_label"])
     return handler
 
-
-old_chat = ""
-from openai import OpenAI
-def summarize_condition(condition):
-    result = OpenAI().chat.completions.create(
-        model = "gpt-4o",
-        temperature = 0.1,
-        messages = [
-            {"role":"user", "content":f"Provide a concise summary of the dermatologic condition: {condition}."}
-        ]
+# ———————————————————————————————
+# 3) Async GPT Summarization
+# ———————————————————————————————
+async def summarize_condition(condition: str) -> str:
+    client = AsyncOpenAI()
+    resp = await client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.1,
+        messages=[{
+            "role": "user",
+            "content": f"Provide a concise summary of the dermatologic condition: {condition}."
+        }]
     )
-    if valid_response:=result.choices[0].message.content:
-        return valid_response
-    return
+    return resp.choices[0].message.content or ""
 
-# 4) Build and return the Gradio Blocks app
+# ———————————————————————————————
+# 4) Build the Gradio App
+# ———————————————————————————————
+label_buffer: list[str] = []
+
 def build_ui():
-    handler = make_handler(skip_every=3)
+    handler  = make_handler(skip_every=3)
+    suppress = {"Normal Skin", "UNKNOWN IMAGE", ""}
 
-    with gr.Blocks(fill_height=True) as demo:
+    with gr.Blocks() as demo:
         gr.Markdown("## MedSigLIP Live Webcam Classification")
 
         with gr.Row():
-
             with gr.Column(scale=0.6):
-                camera = WebRTC(
-                    mode="send-receive",
-                    modality="video",
-                )
+                camera   = WebRTC(mode="send-receive", modality="video")
+                live_box = gr.Textbox(label="🔁 Live Label",
+                                     value="Waiting for inference…",
+                                     interactive=False)
             with gr.Column(scale=1):
-                textbox = gr.Textbox(label="Livestream Label", interactive=False)
-                chatbox = gr.Textbox(label="Detected Skin Conditions", lines=5, interactive=False)
-                diagnosis = gr.Textbox(label="Diagnosis Info", lines=5, interactive=False)
+                alert_box = gr.Textbox(label="🚨 Alert",
+                                       interactive=False, lines=1)
+                dx_info   = gr.Textbox(label="📘 Diagnosis Summary",
+                                       interactive=False, lines=5)
+                reset_btn = gr.Button("Reset Buffer")
 
+        # 1) Capture frame labels into buffer and update live label
         camera.stream(
             fn=VideoStreamHandler(handler, skip_frames=True),
-            inputs=[camera],
-            outputs=[camera],
-            concurrency_limit=1,
+            inputs=[camera], outputs=[camera], concurrency_limit=1
         )
-
+        def capture_label(label: str):
+            if label:
+                label_buffer.append(label)
+            return gr.update(value=label)
         camera.on_additional_outputs(
-            fn=lambda label: label,
-            outputs=[textbox],
-            queue=False
+            fn=capture_label, inputs=[], outputs=[live_box], queue=False
         )
 
+        # 2) Poll for new alerts (only on change, otherwise no‐op)
+        def detect_alert():
+            if not label_buffer:
+                return gr.update()      # no change
+            last = label_buffer[-1]
+            if last not in suppress and last != detect_alert.prev:
+                detect_alert.prev = last
+                return gr.update(value=last)
+            return gr.update()          # preserve existing alert_box
+        detect_alert.prev = ""
 
-        suppress = {"Normal Skin","UNKNOWN IMAGE", "[]"}
+        timer = gr.Timer(0.5, active=True)
+        timer.tick(fn=detect_alert, outputs=[alert_box])
 
-        def append_if_new(label: str, current_chat: str) -> str:
-            # 1) Extract the true label from any patch syntax
-            tokens = re.findall(r"'([^']*)'", label)
-            clean = tokens[-1] if tokens else label
+        # 3) Only summarize once per new alert, and pause 3s
+        async def on_alert(_alert, prev):
+            if not label_buffer:
+                return prev
+            last = label_buffer[-1]
+            if last != on_alert.prev:
+                on_alert.prev = last
+                summary = await summarize_condition(last)
+                await asyncio.sleep(3)
+                return f"{last.upper()}\n{summary}"
+            return prev
+        on_alert.prev = ""
 
-            # 2) Only append if it's in your known labels *and* not suppressed
-            if clean in labels and clean not in suppress:
-                lines = current_chat.splitlines()
-                if clean not in lines:
-                    global old_chat
-                    old_chat = current_chat
-                    return current_chat + ("\n" if current_chat else "") + clean
-
-            return current_chat
-
-        textbox.change(
-            fn=append_if_new,
-            inputs=[textbox, chatbox],
-            outputs=[chatbox],
-            queue=False
+        alert_box.change(
+            fn=on_alert,
+            inputs=[alert_box, dx_info],
+            outputs=[dx_info],
+            queue=False,
         )
 
-
-        def diagnosis_info(chat):
-            if (old_chat is None or old_chat=="") and chat is not None:
-                dx_info = summarize_condition(chat)
-                return chat.upper() + "\n" + str(dx_info)
-        
-        chatbox.change(
-            fn=diagnosis_info,
-            inputs=[chatbox],
-            outputs=[diagnosis],
-            queue=False
+        # 4) Reset: clear everything *including* on_alert.prev
+        def reset_all():
+            label_buffer.clear()
+            detect_alert.prev = ""
+            on_alert.prev = ""
+            # explicitly clear both boxes
+            return gr.update(value=""), gr.update(value="")
+        reset_btn.click(
+            fn=reset_all,
+            outputs=[alert_box, dx_info]
         )
-
 
     return demo
 
+
 if __name__ == "__main__":
-    app = build_ui()
-    app.launch()
+    build_ui().launch(share=False)

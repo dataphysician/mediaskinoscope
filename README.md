@@ -25,3 +25,7 @@ A lightweight, 400 M‑parameter dual‑tower model from Google HAI-DEF that b
 - **TTS Orchestration:** VAPI handles text‑to‑speech generation for spoken alerts, playing LlamaIndex outputs.  
 - **Frontend:** Gradio powers a lightweight dashboard and alert overlay, for instant deployment without custom UI code.  
 - **Backend:** FastAPI with Uvicorn manages the async pipeline—frame ingestion → MedSigLIP → LlamaIndex → VAPI TTS—for high‑throughput, event‑driven processing.
+
+
+## Note:
+LlamaIndex and VAPI have been removed after the hackathon to limit library dependencies.
